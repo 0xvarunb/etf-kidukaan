@@ -1,13 +1,23 @@
 # src/movers_52w_distance.py
+# Schedules: run at 09:30 & 15:15 IST via GitHub Actions
+# Features:
+# - Universe from data/universe_nse.txt (robust path + env override) with safe fallback
+# - Select Top-20 by 60d average Volume (up to today, no look-ahead in scanner context)
+# - Rank Farthest ABOVE / Closest TO 52-week low (252 trading days)
+# - Telegram message only, formatted as neat <pre> tables (copy-friendly)
+
 import os, math, datetime as dt, pathlib
-import numpy as np, pandas as pd, yfinance as yf, requests
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import requests
 
 # -------------------- Config --------------------
 TOP_VOLUME_COUNT = 20
 VOLUME_LOOKBACK_DAYS = 60
 TOP_N = 10
 ROLLING_DAYS_52W = 252
-HIST_PADDING_DAYS = 400
+HIST_PADDING_DAYS = 400  # days of history to download to ensure 252 rows exist
 
 # Telegram (message only)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -27,7 +37,7 @@ def resolve_universe_path() -> pathlib.Path | None:
     here = pathlib.Path(__file__).resolve()
     candidates = [
         here.parent.parent / "data" / "universe_nse.txt",  # repo_root/data (when script in src/)
-        here.parent / "data" / "universe_nse.txt",         # repo_root/data (when script at root)
+        here.parent / "data" / "universe_nse.txt",         # repo_root/data (if script at root)
         pathlib.Path(os.getenv("GITHUB_WORKSPACE", "")) / "data" / "universe_nse.txt",
     ]
     for p in candidates:
@@ -57,10 +67,7 @@ def load_universe(path: pathlib.Path | None) -> list[str]:
         lines = default_list
     else:
         try:
-            lines = [
-                ln.strip() for ln in path.read_text(encoding="utf-8").splitlines()
-                if ln.strip()
-            ]
+            lines = [ln.strip() for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
         except Exception as e:
             print(f"[Warn] Failed to read {path}: {e}. Using built-in default list.")
             lines = default_list
@@ -159,32 +166,67 @@ def fetch_52w_low(tickers, days_52w=252, pad_days=400):
             dates[tickers[0]] = s.idxmin()
     return pd.DataFrame({"low_52w": pd.Series(lows), "low_date": pd.Series(dates)})
 
-def tg_send_message(token, chat_id, text):
+def tg_send_message(token, chat_id, text, parse_mode=None):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    chunks, ok = [], True
-    while text:
-        chunks.append(text[:3900]); text = text[3900:]
-    for c in chunks:
-        r = requests.post(url, data={"chat_id": chat_id, "text": c})
-        ok = ok and r.ok
-    return ok
+    data = {"chat_id": chat_id, "text": text}
+    if parse_mode:
+        data["parse_mode"] = parse_mode  # "HTML" or "MarkdownV2"
+    resp = requests.post(url, data=data)
+    return resp.ok
 
 def ist_now():
     try:
         import pytz
-        return dt.datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S %Z")
+        return dt.datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d %I:%M:%S %p %Z")
     except Exception:
-        return dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        return dt.datetime.utcnow().strftime("%Y-%m-%d %I:%M:%S %p UTC")
+
+def make_pre_table(title: str, df: pd.DataFrame) -> str:
+    """
+    Build a clean ASCII table in a <pre> block:
+    columns: ETF | Price | Δ vs 52W Low
+    """
+    if df is None or df.empty:
+        return f"<i>{title}</i>\n<pre>(no data)</pre>"
+
+    # Prepare display strings
+    rows = []
+    for sym, r in df.iterrows():
+        try:
+            price_val = float(r["last"])
+            pct_val   = float(r["dist_from_52w_low_pct"])
+        except Exception:
+            continue
+        price_str = f"₹{price_val:,.2f}"
+        pct_str   = f"{pct_val:+.2f}%"
+        rows.append((sym, price_str, pct_str))
+
+    # Column widths
+    sym_w = max(3, max(len(x[0]) for x in rows)) if rows else 3
+    pr_w  = max(5, max(len(x[1]) for x in rows)) if rows else 5
+    pc_w  = max(7, max(len(x[2]) for x in rows)) if rows else 7
+
+    # Header & rule
+    header = f"{'ETF':<{sym_w}} | {'Price':>{pr_w}} | {'Δ vs 52W Low':>{pc_w}}"
+    rule   = f"{'-'*sym_w}-+-{'-'*pr_w}-+-{'-'*pc_w}"
+
+    # Body
+    body_lines = [f"{sym:<{sym_w}} | {pr:>{pr_w}} | {pc:>{pc_w}}" for sym, pr, pc in rows]
+
+    table = "\n".join([header, rule, *body_lines])
+    return f"<i>{title}</i>\n<pre>{table}</pre>"
 
 # -------------------- Main --------------------
 def main():
     universe_path = resolve_universe_path()
     universe = load_universe(universe_path)
 
+    # 1) Select Top-20 by 60d Avg Volume
     selected = fetch_avg_volume_topN(universe, VOLUME_LOOKBACK_DAYS, TOP_VOLUME_COUNT)
     if not selected:
         selected = universe[:TOP_VOLUME_COUNT]
 
+    # 2) Latest price & 52w low stats on that selected universe
     latest = fetch_latest_price(selected)
     lowdf  = fetch_52w_low(selected, ROLLING_DAYS_52W, HIST_PADDING_DAYS)
 
@@ -192,30 +234,24 @@ def main():
     df["dist_from_52w_low_pct"] = (df["last"] / df["low_52w"] - 1.0) * 100.0
     df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=["last","low_52w","dist_from_52w_low_pct"])
 
+    # 3) Rank lists
     far = df.sort_values("dist_from_52w_low_pct", ascending=False).head(TOP_N)
     clo = df.sort_values("dist_from_52w_low_pct", ascending=True ).head(TOP_N)
 
-    def block(title, tdf):
-        lines = [title]
-        for i,(sym,r) in enumerate(tdf.iterrows(),1):
-            ld = r["low_date"].strftime("%Y-%m-%d") if pd.notna(r["low_date"]) else "—"
-            lines.append(f"{i:2d}. {sym}  {r['dist_from_52w_low_pct']:+.2f}%  "
-                         f"(last {r['last']:.2f} / 52wLow {r['low_52w']:.2f} on {ld})")
-        return "\n".join(lines)
+    # 4) Pretty Telegram message (HTML + <pre> tables)
+    header_html = (
+        f"<b>ETF 52W Distance Scan @ {ist_now()}</b>\n"
+        f"<i>Universe: Top {TOP_VOLUME_COUNT} by {VOLUME_LOOKBACK_DAYS}-day Avg Volume</i>\n"
+    )
+    table_far = make_pre_table(f"Top {TOP_N} farthest ABOVE 52W low:", far)
+    table_clo = make_pre_table(f"Top {TOP_N} closest TO 52W low:",  clo)
 
-    header = f"Universe: Top {TOP_VOLUME_COUNT} by {VOLUME_LOOKBACK_DAYS}-day Avg Volume\nSelected: {', '.join(selected)}"
-    msg = f"""ETF Distance vs 52-Week Low (IST {ist_now()})
+    msg = f"{header_html}\n{table_far}\n\n{table_clo}"
+    print(msg)  # visible in Actions logs
 
-{header}
-
-{block("Farthest ABOVE 52w Low:", far)}
-
-{block("Closest TO 52w Low:", clo)}
-"""
-    print(msg)
-
+    # 5) Telegram push (message only)
     if TELEGRAM_ENABLE and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        ok = tg_send_message(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, msg)
+        ok = tg_send_message(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, msg, parse_mode="HTML")
         print(f"Telegram sendMessage: {'OK' if ok else 'FAIL'}")
     else:
         print("Telegram disabled or credentials missing; skipping push.")
